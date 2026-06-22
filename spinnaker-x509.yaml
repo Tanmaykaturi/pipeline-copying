@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spinnaker-x509
+type: Opaque
+data:
+  client.crt: <base64-encoded-client-crt>
+  client.key: <base64-encoded-client-key>
+  ca.crt: <base64-encoded-ca-crt>
