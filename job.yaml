@@ -1,0 +1,149 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spinnaker-copy-pipelines
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: spinnaker-copy
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GATE_URL
+              value: "https://spinnaker-x509-api.cdaas.opsmx.org"
+            - name: NEW_APP_NAME
+              value: "ecs-tan-test"
+            - name: APP_EMAIL
+              value: "tanmay.katuri@opsmx.io"
+            - name: SOURCE_APP_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: spinnaker-copy-config
+                  key: SOURCE_APP_NAME
+            - name: PIPELINE_NAMES
+              valueFrom:
+                configMapKeyRef:
+                  name: spinnaker-copy-config
+                  key: PIPELINE_NAMES
+          volumeMounts:
+            - name: x509-certs
+              mountPath: /etc/spinnaker/certs
+              readOnly: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "Installing tools..."
+              apk add --no-cache curl jq bash python3
+
+              echo "Installing spin CLI..."
+              apk add --no-cache go git
+
+              export GOPATH=/tmp/go
+              export PATH=$PATH:$GOPATH/bin
+
+              echo "Cloning spin repository..."
+              cd /tmp
+              git clone --depth 1 --branch v1.30.0 https://github.com/spinnaker/spin.git
+              cd spin
+
+              echo "Building spin..."
+              go build -o /usr/local/bin/spin .
+
+              echo "Build complete. File size:"
+              ls -lh /usr/local/bin/spin
+
+              rm -rf /tmp/spin /tmp/go
+
+              echo "Setting up spin configuration..."
+              CERT="/etc/spinnaker/certs/client.crt"
+              KEY="/etc/spinnaker/certs/client.key"
+              CA="/etc/spinnaker/certs/ca.crt"
+
+              # Add CA cert to system trust store
+              echo "Adding CA certificate to trust store..."
+              cp $CA /usr/local/share/ca-certificates/spinnaker-ca.crt
+              update-ca-certificates
+
+              mkdir -p ~/.spin
+              echo "gate:" > ~/.spin/config
+              echo "  endpoint: $GATE_URL" >> ~/.spin/config
+              echo "auth:" >> ~/.spin/config
+              echo "  enabled: true" >> ~/.spin/config
+              echo "  x509:" >> ~/.spin/config
+              echo "    certPath: $CERT" >> ~/.spin/config
+              echo "    keyPath: $KEY" >> ~/.spin/config
+
+              echo "Spin config created:"
+              cat ~/.spin/config
+
+              echo "Source app: $SOURCE_APP_NAME"
+              echo "Target app: $NEW_APP_NAME"
+
+
+              echo "=== DEBUG: Checking if source app exists ==="
+              spin application get "$SOURCE_APP_NAME" || echo "ERROR: Source app '$SOURCE_APP_NAME' not found!"
+
+              echo "Creating target application if it doesn't exist..."
+              curl -X POST "$GATE_URL/tasks" \
+                --cert $CERT --key $KEY --cacert $CA \
+                -H "Content-Type: application/json" \
+                -d "{\"application\":\"$NEW_APP_NAME\",\"description\":\"Create Application: $NEW_APP_NAME\",\"job\":[{\"type\":\"createApplication\",\"application\":{\"name\":\"$NEW_APP_NAME\",\"email\":\"$APP_EMAIL\",\"cloudProviders\":\"kubernetes\"}}]}" || true
+
+              echo "Fetching pipelines from source app..."
+              PIPELINES_JSON="$(spin pipeline list --application "$SOURCE_APP_NAME" --output json)"
+
+              echo "=== DEBUG: Pipelines found in '$SOURCE_APP_NAME' ==="
+              echo "$PIPELINES_JSON" | jq .
+              echo "=== END DEBUG ==="
+
+              echo "=== DEBUG: Pipeline names to copy ==="
+              echo "$PIPELINE_NAMES"
+              echo "=== END DEBUG ==="
+
+              echo "$PIPELINE_NAMES" | while IFS= read -r PIPELINE_NAME; do
+                # Trim whitespace
+                PIPELINE_NAME="$(echo "$PIPELINE_NAME" | xargs)"
+                [ -z "$PIPELINE_NAME" ] && continue
+
+                echo "Processing pipeline: $PIPELINE_NAME"
+
+                PIPELINE_ID="$(echo "$PIPELINES_JSON" | jq -r --arg name "$PIPELINE_NAME" '.[] | select(.name == $name) | .id' | head -n1)"
+                echo $PIPELINE_ID
+
+                if [ -z "${PIPELINE_ID:-}" ] || [ "$PIPELINE_ID" = "null" ]; then
+                  echo "Pipeline not found: $PIPELINE_NAME"
+                  continue
+                fi
+
+                echo "Fetching full pipeline definition..."
+                PIPELINE_JSON="$(spin pipeline get --application "$SOURCE_APP_NAME" --name "$PIPELINE_NAME" --output json)"
+                echo $PIPELINE_JSON
+
+                if [ -z "$PIPELINE_JSON" ]; then
+                  echo "Failed to fetch pipeline: $PIPELINE_NAME"
+                  continue
+                fi
+
+                echo "Updating application field to $NEW_APP_NAME and removing ID"
+                UPDATED_JSON="$(echo "$PIPELINE_JSON" | jq --arg app "$NEW_APP_NAME" '.application = $app | del(.id)')"
+                echo updated json $UPDATED_JSON
+
+                TMP_FILE="/tmp/${PIPELINE_NAME}.json"
+                echo "$UPDATED_JSON" > "$TMP_FILE"
+
+                echo "Saving pipeline into new app..."
+                spin pipeline save --file "$TMP_FILE"
+
+                echo "Copied pipeline: $PIPELINE_NAME"
+              done
+
+              echo "All done."
+      volumes:
+        - name: x509-certs
+          secret:
+            secretName: spinnaker-x509
