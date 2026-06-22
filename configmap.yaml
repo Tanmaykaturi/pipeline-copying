@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spinnaker-copy-config
+data:
+  SOURCE_APP_NAME: "ecsdeploy"
+  PIPELINE_NAMES: |
+    ecs-pub
+    ecs-private
+    ecs-failure-priv
+    ecs-failure-pub
+    bake
+    lambda-ecs
+    lambda-s3-ecs
